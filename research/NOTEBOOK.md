@@ -34,3 +34,15 @@ via `Solver.to_smt2()` and parsed with z3). Compiler under test: system clang 23
 - KLEE complete on only 15/24 cases within 30 s; ref path coverage by bin paths 0.38. → backlog.
 
 **Next.** Verify the fix (s001-seeded), first real campaign c001.
+
+## 2026-10-20 21:45 — E000 verified; c001 started
+
+- `s001-seeded` (same seeds as s000, `.early` fix): **FP rate 0 %** (19/19 confirmed), recall 7/9,
+  path coverage 0.63 (was 0.38, inflated denominators before). Seeds 12 and 21 detected *only* symbolically.
+- The one "lost" detection (seed 5) was a lucky hit from an early state. Seed 13: KLEE finishes 0 paths
+  in 30 s. **KLEE path completion is now the bottleneck** (15/24 cases complete).
+  Idea: early states are not useless — their π prefix is sound; a model of π can be replayed natively
+  (concrete channel), or the state could be continued concolically. Added to backlog.
+- Started `c001`: first non-seeded campaign, arith seeds 0:200, O1/O2/O3/Os, budget 60 s, 10 jobs.
+  Runs from a git worktree snapshot `work/snap-c001` (commit 22a8591) so subagent edits can't break it.
+- Subagents running: Csmith generator; oracle speed-up.

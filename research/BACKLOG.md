@@ -1,9 +1,8 @@
 # Backlog (ranked; top = next)
 
-1. **Verify the `.early` fix**: re-run seeded campaign `s001-seeded` (seeds 0:24, O2) and compare FP rate
-   with s000 (50 %, all `ref-engine`). Expected: ref-engine FPs gone.
+1. ~~Verify the `.early` fix~~ done (E000, keep).
 2. **First real campaign** `c001` on arith, seeds 0:200, O1/O2/O3/Os. Measure FP causes, coverage, throughput.
-3. **Path coverage is low (0.38 on s000)**: KLEE times out on loop-heavy programs (only 15/24 complete).
+3. **KLEE path completion is the bottleneck** (15/24 complete at 30 s; seed 13: 0 paths). Also use early states: model of their π → native replay: KLEE times out on loop-heavy programs (only 15/24 complete).
    Investigate: per-case path counts; options — smaller loops in generator, KLEE `--search=bfs`,
    longer budget, or concolic seeding (run both engines along the same concrete seed paths).
 4. **Oracle cost**: pairwise R_i × B_j is O(n·m) solver calls; 46 unknowns in s000. Ideas: prefilter pairs
