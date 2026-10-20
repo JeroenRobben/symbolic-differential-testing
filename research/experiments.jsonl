@@ -1,0 +1,1 @@
+{"date": "2026-10-20", "id": "E000", "hypothesis": "Excluding KLEE .early tests removes ref-engine FPs", "change": "ref.py skips .early states", "commit": "pending", "baseline": "s000-seeded", "result": "s001-seeded", "metrics_before": {"fp_rate": 0.5, "recall_symbolic": 0.889}, "metrics_after": null, "verdict": "running"}
