@@ -1,0 +1,6 @@
+tools/
+results/
+.venv/
+__pycache__/
+*.pyc
+work/

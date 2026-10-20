@@ -1,0 +1,8 @@
+[project]
+name = "compiler-checking"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "angr>=10.0.4.post1",
+    "z3-solver>=5.1.0.0",
+]
