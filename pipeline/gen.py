@@ -7,7 +7,10 @@ Every generated program exposes the same harness interface:
 The programs must be free of undefined behaviour for every input.
 """
 import random
+import re
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 N_IN = 16
 
@@ -169,15 +172,128 @@ class ArithGen:
                 "void __test(void) {\n" + "\n".join(lines + body + outs) + "\n}\n")
 
 
+CSMITH_DIR = Path(__file__).resolve().parent.parent / "tools" / "csmith" / "install"
+# Small, scalar-only programs: no pointers/arrays/structs/unions (so every global is a scalar we can
+# seed from __in and observe in __out), no volatiles/checksum/printf (no libc in the body), few
+# functions and shallow blocks so KLEE and angr can enumerate paths within the budget.
+CSMITH_OPTS = [
+    "--no-pointers", "--no-arrays", "--no-structs", "--no-unions", "--no-volatiles", "--no-volatile-pointers",
+    "--no-packed-struct", "--no-bitfields", "--no-checksum", "--no-argc", "--no-jumps", "--no-builtins",
+    "--no-consts", "--no-const-pointers", "--no-float", "--no-inline-function", "--concise",
+    "--max-funcs", "2", "--max-block-depth", "2", "--max-block-size", "3", "--max-expr-complexity", "4",
+]
+CSMITH_K = 4        # globals seeded from __in
+CSMITH_MAX_OUT = 16
+_GLOBAL_RE = re.compile(r"^static (u?int(?:8|16|32|64)_t) (g_\d+) = (.*);$", re.M)
+_SAFE_RE = re.compile(r"STATIC (\w+)\nFUNC_NAME\((\w+)\)(.*?\n}\n)", re.S)
+
+
+def _safe_math_defs():
+    """name -> self-contained C definition of each Csmith safe-math wrapper (as `static` functions)."""
+    txt = (CSMITH_DIR / "include" / "safe_math.h").read_text()
+    return {m.group(2): f"static {m.group(1)}\nsafe_{m.group(2)}{m.group(3)}" for m in _SAFE_RE.finditer(txt)}
+
+
+CSMITH_PRELUDE = """\
+#include <stdint.h>
+#include <limits.h>
+#define UNDEFINED(__val) (__val)
+#define LOG_INDEX
+#define LOG_EXEC
+"""
+
+
+def _csmith_wrap(seed: int, cseed: int, opts, k, max_out):
+    cmd = [str(CSMITH_DIR / "bin" / "csmith"), "--seed", str(cseed), *opts]
+    src = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60).stdout
+    main_at = src.index("\nint main ")
+    body = src[:main_at]
+    body = re.sub(r'^#include "csmith.h"\n', "", body, flags=re.M)
+    body = re.sub(r"^volatile uint64_t csmith_sink_ = 0;\n", "", body, flags=re.M)
+    body = re.sub(r"^static long __undefined;\n", "", body, flags=re.M)
+    body = re.sub(r"^//.*\n", "", body, flags=re.M)
+    globs = _GLOBAL_RE.findall(body)
+    m = re.search(r"^static (\S+)\s+func_1\(void\);", body, re.M)
+    ret_t = m.group(1)
+    # __test goes after the prototypes and before the function definitions, so that seeded mutation
+    # (which only mutates text after `void __test(void) {`) hits Csmith's code too.
+    first_def = re.search(r"^static \S+\s+func_\d+\(.*\)\n\{", body, re.M).start()
+    decls, defs = body[:first_def], body[first_def:]
+    rng = random.Random(seed)
+    lines = [f"  {name} = {init};" for _, name, init in globs]  # re-init: __test may run many times per process
+    off = 0
+    for ctype, name, _ in rng.sample(globs, min(k, len(globs))):
+        nb = int(re.search(r"\d+", ctype).group()) // 8
+        if off + nb > N_IN:
+            continue
+        lines.append(f"  __builtin_memcpy(&{name}, __in + {off}, {nb});")
+        off += nb
+    outs = [f"(uint64_t)func_1_ret"] + [f"(uint64_t){name}" for _, name, _ in globs]
+    if len(outs) > max_out:
+        outs = outs[:max_out - 1] + ["(" + " ^ ".join(outs[max_out - 1:]) + ")"]
+    lines.append(f"  {ret_t} func_1_ret = func_1();")
+    lines += [f"  __out[{i}] = {o};" for i, o in enumerate(outs)]
+    used = set(re.findall(r"\bsafe_(\w+)\(", defs))
+    safe = _safe_math_defs()
+    missing = used - set(safe)
+    if missing:
+        raise ValueError(f"csmith seed {seed}: unknown safe-math wrappers {sorted(missing)}")
+    prelude = CSMITH_PRELUDE + "\n".join(safe[n] for n in sorted(used))
+    test = "void __test(void) {\n" + "\n".join(lines) + "\n}\n\n"
+    src = (f"/* csmith --seed {cseed} {' '.join(opts)} */\n" + prelude
+           + f"\nuint8_t __in[{N_IN}];\nuint64_t __out[{len(outs)}];\n\n" + decls.strip() + "\n\n"
+           + test + defs.strip() + "\n")
+    return src, len(outs)
+
+
+def _csmith_ok(src: str, n_out: int, seed: int, n_inputs=32, timeout=5) -> bool:
+    """Native smoke test: UBSan-clean and terminating on a few inputs. Csmith does not guarantee
+    termination (e.g. `for (x = 0; x != -6; x = (uint8_t)(x - 1))`), and our symbolic globals can
+    change the control flow Csmith reasoned about."""
+    import tempfile
+    from . import build
+    rng = random.Random(seed ^ 0xC5)
+    inputs = [bytes(N_IN), bytes([0xff] * N_IN)] + [bytes(rng.choice([0, 1, 0x7f, 0x80, 0xff, rng.getrandbits(8)])
+                                                         for _ in range(N_IN)) for _ in range(n_inputs - 2)]
+    with tempfile.TemporaryDirectory(prefix="csmith-chk-") as d:
+        c = Path(d) / "prog.c"
+        c.write_text(src)
+        try:
+            exe = build.native(c, Path(d) / "chk", N_IN, n_out, cc=build.CLANG, opt="-O0",
+                               extra=("-fsanitize=undefined", "-fno-sanitize-recover=all"))
+            outs = build.replay_many(exe, inputs, timeout=timeout)
+        except (build.BuildError, subprocess.TimeoutExpired):
+            return False
+    return all(o is not None for o in outs)
+
+
+def csmith_program(seed: int, opts=None, k=CSMITH_K, max_out=CSMITH_MAX_OUT, attempts=20, check=True):
+    """Csmith program wrapped in the harness: K scalar globals overridden from __in, all scalar globals
+    and func_1's return value written to __out. Returns (source, n_out).
+
+    Deterministic in `seed`: Csmith seed `seed` is tried first; if the result fails the native smoke test,
+    derived Csmith seeds are tried in a fixed order."""
+    opts = CSMITH_OPTS if opts is None else opts
+    for a in range(attempts):
+        cseed = seed if a == 0 else random.Random(f"csmith-{seed}-{a}").getrandbits(31)
+        src, n_out = _csmith_wrap(seed, cseed, opts, k, max_out)
+        if not check or _csmith_ok(src, n_out, seed):
+            return src, n_out
+    raise RuntimeError(f"csmith: no terminating UB-free program for seed {seed} in {attempts} attempts")
+
+
 def generate(gen: str, seed: int, **kw) -> Program:
     rng = random.Random(seed)
     if gen == "arith":
         g = ArithGen(rng, **kw)
         src = g.generate()
         return Program(src, N_IN, g.n_vars, gen, seed)
+    if gen == "csmith":
+        src, n_out = csmith_program(seed, **kw)
+        return Program(src, N_IN, n_out, gen, seed)
     raise ValueError(f"unknown generator {gen}")
 
 
 if __name__ == "__main__":
     import sys
-    print(generate("arith", int(sys.argv[1]) if len(sys.argv) > 1 else 0).source)
+    print(generate(sys.argv[2] if len(sys.argv) > 2 else "arith", int(sys.argv[1]) if len(sys.argv) > 1 else 0).source)
